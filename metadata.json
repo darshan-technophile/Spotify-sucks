@@ -1,0 +1,6 @@
+{
+  "name": "Sp*tify sucks!",
+  "description": "Sp*tify sucks! Stream free music from SoundCloud with zero audio cutoffs, modern waveform controls, and proper cover art.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
