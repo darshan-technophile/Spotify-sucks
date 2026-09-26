@@ -16,6 +16,7 @@ import { useMusic } from '../context/MusicContext';
 import { Track } from '../types/music';
 import {
   searchTracks,
+  getInstantMatches,
   isSoundCloudUrl,
   parseSoundCloudUrl,
   DEFAULT_ARTWORK,
@@ -76,20 +77,30 @@ export const MinimalSearch: React.FC = () => {
   const selectedRegion = REGIONS.find((r) => r.id === selectedRegionId) || REGIONS[0];
   const regionalTracks = REGIONAL_TRACKS[selectedRegionId] || REGIONAL_TRACKS.global;
 
-  // Search effect with debounce
+  // Search effect: Instant local feedback (0ms) + debounced background enrichment
   useEffect(() => {
-    if (!query.trim()) {
+    const trimmed = query.trim();
+    if (!trimmed) {
       setResults([]);
       setIsSearching(false);
       return;
     }
 
-    setIsSearching(true);
+    // 1. Instant local match for zero-delay responsiveness
+    const instant = getInstantMatches(trimmed);
+    if (instant.length > 0) {
+      setResults(instant);
+    }
+
+    // 2. Background query to discover additional verified tracks
+    setIsSearching(instant.length === 0);
     const timer = setTimeout(async () => {
-      const res = await searchTracks(query);
-      setResults(res);
+      const res = await searchTracks(trimmed);
+      if (res.length > 0) {
+        setResults(res);
+      }
       setIsSearching(false);
-    }, 180);
+    }, 200);
 
     return () => clearTimeout(timer);
   }, [query]);

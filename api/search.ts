@@ -10,13 +10,46 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)));
 }
 
+// In-memory cache for fast Vercel edge/serverless response
+const searchCache = new Map<string, { data: any[]; timestamp: number }>();
+const CACHE_TTL = 1000 * 60 * 30; // 30 mins
+
+// Helper to filter out spam, bootlegs, and noisy re-uploads
+function isQualityTrack(title: string, artist: string, trackPath: string): boolean {
+  const lowerTitle = title.toLowerCase();
+  const lowerPath = trackPath.toLowerCase();
+
+  const junkPatterns = [
+    /reupload/i,
+    /leak/i,
+    /snippet/i,
+    /slowed\s*\+\s*reverb/i,
+    /earrape/i,
+    /bass\s*boosted/i,
+    /type\s*beat/i,
+    /voice\s*memo/i,
+    /screen\s*record/i,
+    /preview\s*only/i,
+  ];
+
+  if (junkPatterns.some((p) => p.test(lowerTitle))) return false;
+  if (/user-?\d{6,}/i.test(lowerPath) || /aka-?\d{6,}/i.test(lowerPath)) return false;
+
+  return true;
+}
+
 // Fetch official high-res cover artwork
 async function resolveCoverArt(artist: string, title: string, scUrl: string): Promise<string> {
   try {
-    const cleanSearch = `${artist} ${title}`.replace(/[\(\[\{].*?[\)\]\}]/g, '').trim();
+    const cleanSearch = `${artist} ${title}`
+      .replace(/[\(\[\{].*?[\)\]\}]/g, '')
+      .replace(/ft\..*$/i, '')
+      .replace(/feat\..*$/i, '')
+      .trim();
+
     const itunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(cleanSearch)}&entity=song&limit=1`;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1500);
+    const timer = setTimeout(() => ctrl.abort(), 900);
     const itunesRes = await fetch(itunesUrl, { signal: ctrl.signal });
     clearTimeout(timer);
 
@@ -26,14 +59,12 @@ async function resolveCoverArt(artist: string, title: string, scUrl: string): Pr
         return data.results[0].artworkUrl100.replace('100x100bb', '600x600bb');
       }
     }
-  } catch {
-    // Continue to fallback
-  }
+  } catch {}
 
   try {
     const oembedUrl = `https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(scUrl)}`;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1200);
+    const timer = setTimeout(() => ctrl.abort(), 800);
     const oembedRes = await fetch(oembedUrl, { signal: ctrl.signal });
     clearTimeout(timer);
 
@@ -43,9 +74,7 @@ async function resolveCoverArt(artist: string, title: string, scUrl: string): Pr
         return data.thumbnail_url;
       }
     }
-  } catch {
-    // Fallback handled on client
-  }
+  } catch {}
 
   return '';
 }
@@ -55,6 +84,12 @@ export default async function handler(req: any, res: any) {
     const q = String(req.query?.q || '').trim();
     if (!q) {
       return res.status(200).json({ results: [] });
+    }
+
+    const cacheKey = q.toLowerCase();
+    const cached = searchCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return res.status(200).json({ results: cached.data });
     }
 
     const scRes = await fetch(`https://soundcloud.com/search/sounds?q=${encodeURIComponent(q)}`, {
@@ -72,27 +107,36 @@ export default async function handler(req: any, res: any) {
 
     const html = await scRes.text();
     const matches = [...html.matchAll(/<h2>\s*<a\s+href="(\/[^"]+\/[^"]+)">([^<]+)<\/a>/g)];
-    const topMatches = matches.slice(0, 10);
+
+    const cleanMatches: { trackPath: string; rawTitle: string; artist: string }[] = [];
+
+    for (const m of matches) {
+      const trackPath = m[1];
+      const rawTitle = decodeHtmlEntities(m[2].trim());
+      const parts = trackPath.split('/').filter(Boolean);
+      if (parts.length < 2) continue;
+
+      const rawArtist = parts[0].replace(/[-_]/g, ' ');
+      const artist = rawArtist
+        .split(' ')
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+
+      if (isQualityTrack(rawTitle, artist, trackPath)) {
+        cleanMatches.push({ trackPath, rawTitle, artist });
+      }
+      if (cleanMatches.length >= 8) break;
+    }
 
     const results = await Promise.all(
-      topMatches.map(async (m, idx) => {
-        const trackPath = m[1];
-        const rawTitle = decodeHtmlEntities(m[2].trim());
-        const parts = trackPath.split('/').filter(Boolean);
-
-        const rawArtist = parts[0] ? parts[0].replace(/[-_]/g, ' ') : 'SoundCloud Artist';
-        const artist = rawArtist
-          .split(' ')
-          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-          .join(' ');
-
-        const soundCloudUrl = `https://soundcloud.com${trackPath}`;
-        const artworkUrl = await resolveCoverArt(artist, rawTitle, soundCloudUrl);
+      cleanMatches.map(async (item, idx) => {
+        const soundCloudUrl = `https://soundcloud.com${item.trackPath}`;
+        const artworkUrl = await resolveCoverArt(item.artist, item.rawTitle, soundCloudUrl);
 
         return {
-          id: `sc-live-${idx}-${parts.join('-')}`,
-          title: rawTitle,
-          artist,
+          id: `sc-live-${idx}-${item.trackPath.replace(/[^a-zA-Z0-9]/g, '-')}`,
+          title: item.rawTitle,
+          artist: item.artist,
           soundCloudUrl,
           artworkUrl,
           duration: 210,
@@ -100,6 +144,8 @@ export default async function handler(req: any, res: any) {
         };
       })
     );
+
+    searchCache.set(cacheKey, { data: results, timestamp: Date.now() });
 
     return res.status(200).json({ results });
   } catch (err: any) {
